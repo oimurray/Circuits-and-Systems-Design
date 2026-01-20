@@ -1,0 +1,16 @@
+# Arduino build files
+build/
+*.o
+*.elf
+*.hex
+*.tmp
+*.bak
+*.log
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+*.swp
+
