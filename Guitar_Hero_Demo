@@ -1,0 +1,528 @@
+/*
+ * Guitar Hero Style Game — ESP32 + ST7796S
+ * - Game logic runs on Core 1 (Arduino default loop)
+ * - Audio (DAC sine wave) runs on Core 0 via FreeRTOS task
+ * - Beatmap arrival times are derived from song note durations
+ *   so button prompts are perfectly synced with the audio.
+ *
+ * ─── WIRING ───────────────────────────────────────────────────────────
+ *   VCC   → 3.3V
+ *   GND   → GND
+ *   CS    → GPIO 5
+ *   RESET → GPIO 4
+ *   DC/RS → GPIO 2
+ *   MOSI  → GPIO 23
+ *   SCK   → GPIO 18
+ *   LED   → 3.3V
+ *   MISO  → not connected
+ *
+ *   DAC out → GPIO 25 → amp circuit
+ *
+ *   Fret buttons (active LOW, INPUT_PULLUP):
+ *     Lane 0 Red    → GPIO 12
+ *     Lane 1 Green  → GPIO 13
+ *     Lane 2 Yellow → GPIO 14
+ *     Lane 3 Blue   → GPIO 27
+ *
+ *   Strum button (active LOW, INPUT_PULLUP):
+ *     Strum         → GPIO 26
+ *
+*/
+// ═══════════════════════════════════════════════════════════════════════
+//  INCLUDES
+// ═══════════════════════════════════════════════════════════════════════
+#include <Arduino.h>
+#include <TFT_eSPI.h>
+#include <SPI.h>
+#include <math.h>
+
+// ═══════════════════════════════════════════════════════════════════════
+//  PIN DEFINITIONS
+// ═══════════════════════════════════════════════════════════════════════
+#define DAC_PIN  25   // ESP32 DAC channel 1
+
+const uint8_t FRET_PINS[4] = { 12, 13, 14, 27 };
+#define PIN_STRUM  35
+
+// ═══════════════════════════════════════════════════════════════════════
+//  DISPLAY
+// ═══════════════════════════════════════════════════════════════════════
+#define SCREEN_W  320
+#define SCREEN_H  480
+#define ROTATION  0
+
+TFT_eSPI tft = TFT_eSPI();
+
+// ═══════════════════════════════════════════════════════════════════════
+//  COLOURS
+// ═══════════════════════════════════════════════════════════════════════
+#define C_BLACK   0x0000
+#define C_WHITE   0xFFFF
+#define C_RED     0xF800
+#define C_GREEN   0x07E0
+#define C_YELLOW  0xFFE0
+#define C_BLUE    0x001F
+#define C_GREY    0x2945
+
+const uint16_t LANE_COLORS[4] = { C_RED, C_GREEN, C_YELLOW, C_BLUE };
+
+// ═══════════════════════════════════════════════════════════════════════
+//  GAME LAYOUT CONSTANTS
+// ═══════════════════════════════════════════════════════════════════════
+#define NUM_LANES    4
+#define LANE_W       70
+#define LANE_GAP      5
+#define NOTE_RADIUS  22
+#define HIT_ZONE_Y   430
+#define HIT_ZONE_R    26
+#define HIT_WINDOW    40
+#define NOTE_SPEED   100
+#define LANE_MARGIN   13
+
+#define STRUM_UP_THRESHOLD 2200
+#define STRUM_DOWN_THRESHOLD 1800
+
+int laneCX[NUM_LANES];
+
+// ═══════════════════════════════════════════════════════════════════════
+//  AUDIO ENGINE  (Core 0)
+// ═══════════════════════════════════════════════════════════════════════
+#define TABLE_SIZE  256
+#define TIMER_FREQ  112640
+
+uint8_t sineTable[TABLE_SIZE];
+hw_timer_t *audioTimer = NULL;
+
+volatile uint32_t gPhaseStep = 0;
+volatile uint32_t gPhase     = 0;
+volatile bool     gPlaying   = false;
+
+void IRAM_ATTR onTimer() {
+  if (!gPlaying) {
+    dacWrite(DAC_PIN, 128);
+    return;
+  }
+  gPhase += gPhaseStep;
+  if (gPhase >= (uint32_t)TABLE_SIZE * 1000)
+    gPhase -= (uint32_t)TABLE_SIZE * 1000;
+  dacWrite(DAC_PIN, sineTable[gPhase / 1000]);
+}
+
+void audioSetNote(float freq) {
+  if (freq == 0.0f) {
+    gPlaying = false;
+    return;
+  }
+  uint32_t step = (uint32_t)(((float)TABLE_SIZE * freq) / (float)TIMER_FREQ * 1000.0f);
+  gPhase     = 0;
+  gPhaseStep = step;
+  gPlaying   = true;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  SONG / BEATMAP
+//  Each SongNote: freq (Hz), durMs, lane (0-3)
+//  buildBeatmap() derives visual note arrival times from durations
+//  so audio and on-screen notes are always in sync.
+// ═══════════════════════════════════════════════════════════════════════
+#define C4   261.63f
+#define D4   293.66f
+#define E4   329.63f
+#define F4   349.23f
+#define G4   392.00f
+#define A4   440.00f
+#define REST   0.0f
+
+struct SongNote {
+  float    freq;
+  uint32_t durMs;
+  uint8_t  lane;
+};
+
+// Twinkle Twinkle Little Star
+const SongNote SONG[] = {
+  //freq  dur   lane
+  { C4,  400,  0 },   //  0  Red
+  { C4,  400,  1 },   //  1  Green
+  { G4,  400,  2 },   //  2  Yellow
+  { G4,  400,  3 },   //  3  Blue
+  { A4,  400,  0 },   //  4  Red
+  { A4,  400,  1 },   //  5  Green
+  { G4,  800,  2 },   //  6  Yellow  (long)
+  { F4,  400,  3 },   //  7  Blue
+  { F4,  400,  0 },   //  8  Red
+  { E4,  400,  1 },   //  9  Green
+  { E4,  400,  2 },   // 10  Yellow
+  { D4,  400,  3 },   // 11  Blue
+  { D4,  400,  0 },   // 12  Red
+  { C4,  800,  1 },   // 13  Green   (long)
+  { G4,  400,  2 },   // 14  Yellow
+  { G4,  400,  3 },   // 15  Blue
+  { F4,  400,  0 },   // 16  Red
+  { F4,  400,  1 },   // 17  Green
+  { E4,  400,  2 },   // 18  Yellow
+  { E4,  400,  3 },   // 19  Blue
+  { D4,  800,  0 },   // 20  Red     (long)
+};
+const int SONG_LENGTH = sizeof(SONG) / sizeof(SONG[0]);
+
+struct BeatmapEntry {
+  uint32_t arrivalMs;
+  uint8_t  lane;
+};
+
+BeatmapEntry BEATMAP[sizeof(SONG) / sizeof(SONG[0])];
+int BEATMAP_LEN = 0;
+
+void buildBeatmap() {
+  uint32_t t = 0;
+  BEATMAP_LEN = 0;
+  for (int i = 0; i < SONG_LENGTH; i++) {
+    if (SONG[i].freq != REST) {
+      BEATMAP[BEATMAP_LEN].arrivalMs = t + SONG[i].durMs / 2;
+      BEATMAP[BEATMAP_LEN].lane      = SONG[i].lane;
+      BEATMAP_LEN++;
+    }
+    t += SONG[i].durMs;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  AUDIO TASK  (Core 0)
+// ═══════════════════════════════════════════════════════════════════════
+void audioTask(void *pvParameters) {
+  extern volatile uint32_t gameStartMs;
+  while (gameStartMs == 0) vTaskDelay(1);
+
+  for (int i = 0; i < SONG_LENGTH; i++) {
+    audioSetNote(SONG[i].freq);
+    uint32_t onMs  = (uint32_t)(SONG[i].durMs * 0.85f);
+    uint32_t offMs = SONG[i].durMs - onMs;
+    vTaskDelay(pdMS_TO_TICKS(onMs));
+    gPlaying = false;
+    vTaskDelay(pdMS_TO_TICKS(offMs));
+  }
+  dacWrite(DAC_PIN, 128);   // silence after song ends
+  vTaskDelete(NULL);
+}
+
+// void audioTask(void *pvParameters) {
+//   extern volatile uint32_t gameStartMs;
+//   while (gameStartMs == 0) vTaskDelay(1);
+
+//   // Wait for the first note to travel from top of screen to hit zone
+//   // travelMs = (HIT_ZONE_Y + NOTE_RADIUS * 2) / NOTE_SPEED * 1000
+//   // = (430 + 44) / 220 * 1000 = ~2109ms
+//   uint32_t travelMs = (uint32_t)(((float)(HIT_ZONE_Y + NOTE_RADIUS * 2) / NOTE_SPEED) * 1000.0f);
+//   vTaskDelay(pdMS_TO_TICKS(travelMs));
+
+//   for (int i = 0; i < SONG_LENGTH; i++) {
+//     audioSetNote(SONG[i].freq);
+//     uint32_t onMs  = (uint32_t)(SONG[i].durMs * 0.85f);
+//     uint32_t offMs = SONG[i].durMs - onMs;
+//     vTaskDelay(pdMS_TO_TICKS(onMs));
+//     gPlaying = false;
+//     vTaskDelay(pdMS_TO_TICKS(offMs));
+//   }
+//   dacWrite(DAC_PIN, 128);
+//   vTaskDelete(NULL);
+// }
+
+// ═══════════════════════════════════════════════════════════════════════
+//  VISUAL NOTE STATE
+// ═══════════════════════════════════════════════════════════════════════
+#define MAX_NOTES  20
+
+struct VisualNote {
+  bool    active;
+  uint8_t lane;
+  float   y;
+  int16_t prevY;
+};
+
+VisualNote notes[MAX_NOTES];
+
+// ═══════════════════════════════════════════════════════════════════════
+//  GAME STATE
+// ═══════════════════════════════════════════════════════════════════════
+int      score      = 0;
+int      combo      = 0;
+int      beatmapIdx = 0;
+volatile uint32_t gameStartMs = 0;
+
+bool fretState[NUM_LANES]     = {};
+bool fretPrevState[NUM_LANES] = {};
+
+bool strumUp = false;
+bool strumDown = false;
+bool prevStrumUp = false;
+bool prevStrumDown = false;
+
+int joyY;
+
+bool rawUp   = joyY > STRUM_UP_THRESHOLD;
+bool rawDown = joyY < STRUM_DOWN_THRESHOLD;
+
+int prevScore = -1;
+int prevCombo = -1;
+
+struct FlashState { bool active; uint8_t lane; uint32_t endMs; };
+FlashState flash = { false, 0, 0 };
+
+// ═══════════════════════════════════════════════════════════════════════
+//  DRAWING HELPERS
+// ═══════════════════════════════════════════════════════════════════════
+void eraseNote(int i) {
+  if (notes[i].prevY < 0) return;
+  tft.fillCircle(laneCX[notes[i].lane],
+                 notes[i].prevY + NOTE_RADIUS,
+                 NOTE_RADIUS + 1, C_GREY);
+}
+
+void drawNote(int i) {
+  int cx = laneCX[notes[i].lane];
+  int cy = (int)notes[i].y + NOTE_RADIUS;
+  tft.fillCircle(cx, cy, NOTE_RADIUS, LANE_COLORS[notes[i].lane]);
+  tft.drawCircle(cx, cy, NOTE_RADIUS, C_WHITE);
+  notes[i].prevY = (int16_t)notes[i].y;
+}
+
+void drawHitZones() {
+  for (int i = 0; i < NUM_LANES; i++) {
+    tft.drawCircle(laneCX[i], HIT_ZONE_Y, HIT_ZONE_R,     LANE_COLORS[i]);
+    tft.drawCircle(laneCX[i], HIT_ZONE_Y, HIT_ZONE_R - 1, LANE_COLORS[i]);
+  }
+}
+
+void updateScoreDisplay() {
+  if (score != prevScore) {
+    tft.fillRect(0, 0, SCREEN_W, 28, C_BLACK);
+    tft.setCursor(4, 6);
+    tft.setTextColor(C_WHITE, C_BLACK);
+    tft.setTextSize(2);
+    tft.print("Score: ");
+    tft.print(score);
+    prevScore = score;
+  }
+  if (combo != prevCombo) {
+    tft.fillRect(0, 30, SCREEN_W, 22, C_BLACK);
+    if (combo > 1) {
+      tft.setCursor(4, 32);
+      tft.setTextColor(C_YELLOW, C_BLACK);
+      tft.setTextSize(2);
+      tft.print("Combo x");
+      tft.print(combo);
+    }
+    prevCombo = combo;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  SETUP
+// ═══════════════════════════════════════════════════════════════════════
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Booting...");
+
+  for (int i = 0; i < NUM_LANES; i++)
+    pinMode(FRET_PINS[i], INPUT_PULLUP);
+  //pinMode(PIN_STRUM, INPUT_PULLUP);
+
+  for (int i = 0; i < NUM_LANES; i++)
+    laneCX[i] = LANE_MARGIN + i * (LANE_W + LANE_GAP) + LANE_W / 2;
+
+  tft.init();
+  tft.setRotation(ROTATION);
+  tft.fillScreen(C_BLACK);
+  Serial.println("Display OK");
+
+  for (int i = 0; i < NUM_LANES; i++)
+    tft.fillRect(LANE_MARGIN + i * (LANE_W + LANE_GAP), 55,
+                 LANE_W, SCREEN_H - 55 - 10, C_GREY);
+
+  drawHitZones();
+
+  for (int i = 0; i < MAX_NOTES; i++) {
+    notes[i].active = false;
+    notes[i].prevY  = -1;
+  }
+
+  updateScoreDisplay();
+
+  // ── Sine table ────────────────────────────────────────────────────
+  for (int i = 0; i < TABLE_SIZE; i++)
+    sineTable[i] = (uint8_t)(127.5f + 127.5f * sinf(2.0f * PI * i / TABLE_SIZE));
+
+  // ── Hardware timer for DAC ISR ────────────────────────────────────
+  audioTimer = timerBegin(TIMER_FREQ);
+  timerAttachInterrupt(audioTimer, &onTimer);
+  timerAlarm(audioTimer, 1, true, 0);
+
+  buildBeatmap();
+
+  tft.setCursor(60, 220);
+  tft.setTextColor(C_WHITE, C_BLACK);
+  tft.setTextSize(4);
+  tft.print("READY?");
+  delay(2000);
+  tft.fillRect(0, 200, SCREEN_W, 80, C_BLACK);
+
+  // ── Launch audio task on Core 0 ───────────────────────────────────
+  xTaskCreatePinnedToCore(audioTask, "AudioTask", 2048, NULL, 1, NULL, 0);
+
+  gameStartMs = millis();
+  Serial.println("Game started");
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  LOOP  (Core 1)
+// ═══════════════════════════════════════════════════════════════════════
+void loop() {
+  static uint32_t lastMs = 0;
+  uint32_t nowMs  = millis();
+  uint32_t gameMs = nowMs - gameStartMs;
+  float    dt     = (nowMs - lastMs) / 1000.0f;
+  lastMs = nowMs;
+
+  // ── 1. Read fret buttons ───────────────────────────────────────────
+  for (int i = 0; i < NUM_LANES; i++) {
+    fretState[i]     = (digitalRead(FRET_PINS[i]) == LOW);
+    fretPrevState[i] = fretState[i];
+  }
+
+  // ── 2. Read strum button ───────────────────────────────────────────
+  int joyY = analogRead(PIN_STRUM);
+  bool rawUp   = joyY > STRUM_UP_THRESHOLD;
+  bool rawDown = joyY < STRUM_DOWN_THRESHOLD;
+
+  strumUp   = rawUp   && !prevStrumUp;    // rising edge only
+  strumDown = rawDown && !prevStrumDown;
+
+  prevStrumUp   = rawUp;
+  prevStrumDown = rawDown;
+
+  // ── 3. Spawn notes ─────────────────────────────────────────────────
+  uint32_t travelMs = (uint32_t)(
+    ((float)(HIT_ZONE_Y + NOTE_RADIUS * 2) / NOTE_SPEED) * 1000.0f);
+
+  while (beatmapIdx < BEATMAP_LEN) {
+    uint32_t arrMs = BEATMAP[beatmapIdx].arrivalMs;
+    if (gameMs + travelMs >= arrMs) {
+      for (int i = 0; i < MAX_NOTES; i++) {
+        if (!notes[i].active) {
+          notes[i].active = true;
+          notes[i].lane   = BEATMAP[beatmapIdx].lane;
+          notes[i].y      = -(float)(NOTE_RADIUS * 2);
+          notes[i].prevY  = -1;
+          break;
+        }
+      }
+      beatmapIdx++;
+    } else {
+      break;
+    }
+  }
+
+  // ── 4. Move notes downward ─────────────────────────────────────────
+  for (int i = 0; i < MAX_NOTES; i++) {
+    if (!notes[i].active) continue;
+    eraseNote(i);
+    notes[i].y += NOTE_SPEED * dt;
+    if (notes[i].y > SCREEN_H + NOTE_RADIUS) {
+      notes[i].active = false;
+      combo     = 0;
+      prevCombo = -1;
+    }
+  }
+
+  // ── 5. Hit detection (strum triggers check) ────────────────────────
+  if (strumUp && strumDown) {
+    bool anyHit = false;
+
+    for (int lane = 0; lane < NUM_LANES; lane++) {
+      if (!fretState[lane]) continue;
+
+      int   bestIdx  = -1;
+      float bestDist = HIT_WINDOW + 1.0f;
+
+      for (int i = 0; i < MAX_NOTES; i++) {
+        if (!notes[i].active || notes[i].lane != lane) continue;
+        float cy   = notes[i].y + NOTE_RADIUS;
+        float dist = fabsf(cy - (float)HIT_ZONE_Y);
+        if (dist <= HIT_WINDOW && dist < bestDist) {
+          bestDist = dist;
+          bestIdx  = i;
+        }
+      }
+
+      if (bestIdx >= 0) {
+        eraseNote(bestIdx);
+        notes[bestIdx].active = false;
+        score += 10 + combo;
+        combo++;
+        anyHit = true;
+        flash.active = true;
+        flash.lane   = lane;
+        flash.endMs  = nowMs + 60;
+        tft.fillCircle(laneCX[lane], HIT_ZONE_Y, HIT_ZONE_R, C_WHITE);
+        Serial.printf("HIT  lane=%d  score=%d  combo=%d\n", lane, score, combo);
+      }
+    }
+
+    if (!anyHit) {
+      combo     = 0;
+      prevCombo = -1;
+      Serial.println("MISS");
+    }
+  }
+
+  // ── 6. Resolve hit flash ───────────────────────────────────────────
+  if (flash.active && nowMs >= flash.endMs) {
+    flash.active = false;
+    int lane = flash.lane;
+    tft.fillCircle(laneCX[lane], HIT_ZONE_Y, HIT_ZONE_R, C_BLACK);
+    tft.drawCircle(laneCX[lane], HIT_ZONE_Y, HIT_ZONE_R,     LANE_COLORS[lane]);
+    tft.drawCircle(laneCX[lane], HIT_ZONE_Y, HIT_ZONE_R - 1, LANE_COLORS[lane]);
+  }
+
+  // ── 7. Draw active notes ───────────────────────────────────────────
+  for (int i = 0; i < MAX_NOTES; i++)
+    if (notes[i].active) drawNote(i);
+
+  // ── 8. Hit zone fret-hold feedback ────────────────────────────────
+  for (int i = 0; i < NUM_LANES; i++) {
+    if (flash.active && flash.lane == i) continue;
+    if (fretState[i]) {
+      tft.fillCircle(laneCX[i], HIT_ZONE_Y, HIT_ZONE_R, LANE_COLORS[i]);
+    } else {
+      tft.fillCircle(laneCX[i], HIT_ZONE_Y, HIT_ZONE_R, C_BLACK);
+      tft.drawCircle(laneCX[i], HIT_ZONE_Y, HIT_ZONE_R,     LANE_COLORS[i]);
+      tft.drawCircle(laneCX[i], HIT_ZONE_Y, HIT_ZONE_R - 1, LANE_COLORS[i]);
+    }
+  }
+
+  // ── 9. Score / combo HUD ───────────────────────────────────────────
+  updateScoreDisplay();
+
+  // ── 10. End-of-song ────────────────────────────────────────────────
+  if (beatmapIdx >= BEATMAP_LEN) {
+    bool anyActive = false;
+    for (int i = 0; i < MAX_NOTES; i++)
+      if (notes[i].active) { anyActive = true; break; }
+
+    if (!anyActive) {
+      tft.fillScreen(C_BLACK);
+      tft.setCursor(40, 180);
+      tft.setTextColor(C_YELLOW, C_BLACK);
+      tft.setTextSize(3);
+      tft.println("SONG CLEAR!");
+      tft.setCursor(60, 230);
+      tft.setTextColor(C_WHITE, C_BLACK);
+      tft.setTextSize(2);
+      tft.print("Score: ");
+      tft.println(score);
+      dacWrite(DAC_PIN, 128);
+      while (true);
+    }
+  }
+}
